@@ -1,0 +1,93 @@
+{
+  "plugins": [
+    {
+      "name": "context-mode",
+      "repo": "mksglu/context-mode",
+      "track": "release",
+      "pin": {
+        "ref": "v2.1.7",
+        "commit": "9bd2dbf8ee1de646f80fe6ec99d9c1662b07e0e7"
+      },
+      "requires": {
+        "node": "24.15"
+      },
+      "claude": {
+        "marketplace": "context-mode",
+        "plugin": "context-mode"
+      },
+      "codex": {
+        "marketplace": "context-mode",
+        "plugin": "context-mode",
+        "path": "plugins/claude-code"
+      }
+    },
+    {
+      "name": "ponytail",
+      "repo": "DietrichGebert/ponytail",
+      "track": "release",
+      "pin": {
+        "ref": "v5.3.3",
+        "commit": "7801d061243d7b753bad0e0b3c057cd250b11755"
+      },
+      "requires": {
+        "node": "18"
+      },
+      "claude": {
+        "marketplace": "ponytail",
+        "plugin": "ponytail"
+      },
+      "codex": {
+        "marketplace": "ponytail",
+        "plugin": "ponytail",
+        "path": "."
+      }
+    },
+    {
+      "name": "caveman",
+      "repo": "JuliusBrussee/caveman",
+      "track": "release",
+      "pin": {
+        "ref": "v4.1.0",
+        "commit": "1e91f1306d602d4ca23618701b1185575ae1869b"
+      },
+      "requires": {
+        "node": "18"
+      },
+      "claude": {
+        "marketplace": "caveman",
+        "plugin": "caveman"
+      },
+      "codex": {
+        "installer": [
+          "node",
+          "installer/install.js",
+          "--only",
+          "codex",
+          "--non-interactive",
+          "--force"
+        ]
+      }
+    },
+    {
+      "name": "tokeneconomizer",
+      "repo": "microsoft/TokenEconomizer",
+      "track": "release",
+      "pin": {
+        "ref": "v0.1.0",
+        "commit": "ec8ff5ec7ed5924520ee71b705a920ee64fe2918"
+      },
+      "requires": {
+        "python3": "3.10"
+      },
+      "claude": {
+        "marketplace": "tokeneconomizer",
+        "plugin": "tokeneconomizer"
+      },
+      "codex": {
+        "marketplace": "tokeneconomizer",
+        "plugin": "tokeneconomizer",
+        "path": "plugin"
+      }
+    }
+  ]
+}

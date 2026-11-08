@@ -1,0 +1,10 @@
+{
+  "config_files": {
+    "${XDG_CONFIG_HOME}/caveman/config.json": {"defaultMode": "ultracave"},
+    "${XDG_CONFIG_HOME}/ponytail/config.json": {"defaultMode": "full"}
+  },
+  "tokeneconomizer": {"toolprune": "on", "loopguard": "on", "microskills": "off"},
+  "instruction_blocks": {
+    "${CODEX_HOME}/AGENTS.md": "profile/codex-AGENTS.md"
+  }
+}

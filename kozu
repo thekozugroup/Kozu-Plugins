@@ -1,0 +1,553 @@
+#!/usr/bin/env python3
+"""kozu: keep Claude Code and Codex plugins at the versions pinned in plugins.json.
+
+  kozu install      sync now, then run sync every 6 hours (launchd on macOS, cron on Linux)
+  kozu sync         pull this repo, check out each pinned plugin commit, install or update it
+                    in Claude Code and Codex, and apply profile.json
+  kozu status       pins, checkouts and what each host has installed
+  kozu bump         move pins to the newest upstream release (run daily by GitHub Actions)
+  kozu schedule | unschedule
+
+Standard library only; Python 3.9+.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import plistlib
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+VENDOR = ROOT / "vendor"
+STATE_DIR = ROOT / ".state"
+STATE_FILE = STATE_DIR / "state.json"
+PLUGINS_FILE = ROOT / "plugins.json"
+PROFILE_FILE = ROOT / "profile.json"
+BLOCK_START = "<!-- kozu-plugins:start -->"
+BLOCK_END = "<!-- kozu-plugins:end -->"
+LABEL = "com.kozu-plugins.sync"
+CRON_MARK = "# kozu-plugins-sync"
+SEMVER = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+# Variables the scheduled job inherits, so it finds the same CLIs and config dirs as your shell.
+PASS_ENV = ("PATH", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_CONFIG_HOME", "TE_PYTHON")
+
+
+class Failed(Exception):
+    pass
+
+
+def log(msg: str) -> None:
+    print(f"kozu: {msg}", flush=True)
+
+
+def run(cmd, cwd=None, input=None, check=True) -> subprocess.CompletedProcess:
+    cmd = [str(c) for c in cmd]
+    try:
+        r = subprocess.run(cmd, cwd=cwd, input=input, text=True, capture_output=True)
+    except FileNotFoundError:
+        raise Failed(f"{cmd[0]}: command not found")
+    if check and r.returncode:
+        detail = (r.stderr.strip() or r.stdout.strip())[-600:]
+        raise Failed(f"`{' '.join(cmd)}` exited {r.returncode}: {detail}")
+    return r
+
+
+def run_json(cmd):
+    return json.loads(run(cmd).stdout or "null")
+
+
+def load_json(path: Path, default):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return default
+
+
+def save_json(path: Path, data) -> bool:
+    text = json.dumps(data, indent=2) + "\n"
+    if path.exists() and path.read_text() == text:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return True
+
+
+def expand(path: str) -> Path:
+    """Expand ~ and ${VAR}; XDG_CONFIG_HOME, CODEX_HOME, CLAUDE_CONFIG_DIR fall back to their defaults."""
+    home = Path.home()
+    env = {"XDG_CONFIG_HOME": str(home / ".config"), "CODEX_HOME": str(home / ".codex"),
+           "CLAUDE_CONFIG_DIR": str(home / ".claude")}
+    env.update({k: v for k, v in os.environ.items() if v})
+    return Path(os.path.expanduser(re.sub(r"\$\{(\w+)\}", lambda m: env.get(m.group(1), m.group(0)), path)))
+
+
+def same_path(a, b) -> bool:
+    return bool(a) and os.path.realpath(a) == os.path.realpath(b)
+
+
+def repo_url(p: dict) -> str:
+    return p.get("url") or f"https://github.com/{p['repo']}.git"
+
+
+def plugin_id(host: dict) -> str:
+    return f"{host['plugin']}@{host['marketplace']}"
+
+
+# ---------------------------------------------------------------- upstream versions
+
+def ls_remote(url: str, pattern: str) -> dict:
+    """ref name -> commit; an annotated tag maps to the commit it points at."""
+    refs = {}
+    for line in run(["git", "ls-remote", url, pattern]).stdout.splitlines():
+        sha, ref = line.split("\t")
+        if ref.endswith("^{}"):
+            refs[ref[:-3]] = sha
+        else:
+            refs.setdefault(ref, sha)
+    return refs
+
+
+def latest_release(tags: dict):
+    """(tag, commit) of the highest stable semver tag, or None. Pre-releases are skipped."""
+    found = [(tuple(int(x) for x in m.groups()), t) for t in tags if (m := SEMVER.match(t))]
+    if not found:
+        return None
+    tag = max(found)[1]
+    return tag, tags[tag]
+
+
+def resolve(p: dict):
+    """(ref, commit) that p's track points at now, or None for a frozen pin."""
+    track = p.get("track", "release")
+    if track == "pinned":
+        return None
+    if track == "release":
+        refs = ls_remote(repo_url(p), "refs/tags/*")
+        found = latest_release({r[len("refs/tags/"):]: sha for r, sha in refs.items()})
+        if not found:
+            raise Failed(f"{p['name']}: no release tags (vX.Y.Z) in {p['repo']}; use track branch:<name>")
+        return found
+    if track.startswith("branch:"):
+        branch = track.split(":", 1)[1]
+        refs = ls_remote(repo_url(p), f"refs/heads/{branch}")
+        if not refs:
+            raise Failed(f"{p['name']}: branch {branch} not found in {p['repo']}")
+        return branch, next(iter(refs.values()))
+    raise Failed(f"{p['name']}: unknown track {track!r} (release, branch:<name>, pinned)")
+
+
+# ---------------------------------------------------------------- checkouts
+
+def head(dest: Path):
+    r = run(["git", "-C", dest, "rev-parse", "HEAD"], check=False)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def checkout(dest: Path, url: str, commit: str) -> bool:
+    """Make dest a checkout of url at commit. True when the checkout changed."""
+    if not (dest / ".git").exists():
+        dest.mkdir(parents=True, exist_ok=True)
+        run(["git", "-C", dest, "init", "-q"])
+        run(["git", "-C", dest, "remote", "add", "origin", url])
+    else:
+        run(["git", "-C", dest, "remote", "set-url", "origin", url])
+    if head(dest) == commit:
+        return False
+    run(["git", "-C", dest, "fetch", "-q", "--depth", "1", "origin", commit])
+    run(["git", "-C", dest, "checkout", "-q", "--force", "--detach", commit])
+    return True
+
+
+def verify(p: dict, root: Path) -> list:
+    """Problems that would stop kozu from installing p from the checkout at root."""
+    problems = []
+    c = p.get("claude")
+    if c:
+        market = load_json(root / ".claude-plugin" / "marketplace.json", None)
+        if not market:
+            problems.append(".claude-plugin/marketplace.json is missing")
+        elif market.get("name") != c["marketplace"]:
+            problems.append(f"Claude marketplace is named {market.get('name')!r}, not {c['marketplace']!r}")
+        elif c["plugin"] not in {x.get("name") for x in market.get("plugins", [])}:
+            problems.append(f"Claude marketplace has no plugin {c['plugin']!r}")
+    x = p.get("codex")
+    if x and "installer" in x:
+        for arg in x["installer"][1:]:
+            if "/" in arg and not (root / arg).exists():
+                problems.append(f"Codex installer {arg} is missing")
+    elif x:
+        manifest = load_json(root / x.get("path", ".") / ".codex-plugin" / "plugin.json", None)
+        if not manifest:
+            problems.append(f"{x.get('path', '.')}/.codex-plugin/plugin.json is missing")
+        elif manifest.get("name") != x["plugin"]:
+            problems.append(f"Codex plugin is named {manifest.get('name')!r}, not {x['plugin']!r}")
+    return problems
+
+
+# ---------------------------------------------------------------- hosts
+
+def sync_claude(plugins: list, errors: list) -> None:
+    claude = shutil.which("claude")
+    if not claude:
+        log("Claude Code (claude) not on PATH: skipped")
+        return
+    markets = {m["name"]: m for m in run_json([claude, "plugin", "marketplace", "list", "--json"]) or []}
+    installed = {p["id"]: p for p in run_json([claude, "plugin", "list", "--json"]) or []}
+    for p in plugins:
+        c = p.get("claude")
+        if not c:
+            continue
+        pid, want = plugin_id(c), VENDOR / p["name"]
+        try:
+            m = markets.get(c["marketplace"])
+            if m and not same_path(m.get("path"), want):
+                # Installed from somewhere else (usually upstream GitHub): move it to the pinned checkout.
+                if pid in installed:
+                    run([claude, "plugin", "uninstall", pid, "--keep-data"])
+                    installed.pop(pid)
+                run([claude, "plugin", "marketplace", "remove", c["marketplace"]])
+                m = None
+            if not m:
+                run([claude, "plugin", "marketplace", "add", want])
+            if pid not in installed:
+                run([claude, "plugin", "install", pid])
+                log(f"Claude Code: installed {pid}")
+            elif installed[pid].get("enabled") is False:
+                run([claude, "plugin", "enable", pid])
+                log(f"Claude Code: enabled {pid}")
+        except Failed as e:
+            errors.append(f"Claude Code {pid}: {e}")
+
+
+def codex_marketplace(p: dict) -> Path:
+    """A one-plugin Codex marketplace whose plugin is the pinned checkout.
+
+    Upstream marketplaces can point Codex at a moving branch (ponytail's points at main),
+    so kozu writes its own under the upstream name, with a symlink to the checkout."""
+    x = p["codex"]
+    root = STATE_DIR / "codex-marketplaces" / x["marketplace"]
+    link = root / "plugin"
+    root.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to((VENDOR / p["name"] / x.get("path", ".")).resolve())
+    save_json(root / ".agents" / "plugins" / "marketplace.json", {
+        "name": x["marketplace"],
+        "plugins": [{
+            "name": x["plugin"],
+            "source": {"source": "local", "path": "./plugin"},
+            "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+            "category": "Productivity",
+        }],
+    })
+    return root
+
+
+def sync_codex(plugins: list, state: dict, errors: list, force: bool) -> bool:
+    """Returns True when a Codex plugin was installed or updated (its hooks need trusting)."""
+    codex = shutil.which("codex")
+    if not codex:
+        log("Codex (codex) not on PATH: skipped")
+        return False
+    markets = {m["name"]: m for m in (run_json([codex, "plugin", "marketplace", "list", "--json"]) or {}).get("marketplaces", [])}
+    installed = {p["pluginId"] for p in (run_json([codex, "plugin", "list", "--json"]) or {}).get("installed", [])
+                 if p.get("installed")}
+    done = state.setdefault("codex", {})
+    changed = False
+    for p in plugins:
+        x = p.get("codex")
+        if not x:
+            continue
+        commit = p["pin"]["commit"]
+        current = done.get(p["name"]) == commit and not force
+        try:
+            if "installer" in x:
+                if not current:
+                    run(x["installer"], cwd=VENDOR / p["name"])
+                    log(f"Codex: ran {p['name']}'s installer at {p['pin']['ref']}")
+                    done[p["name"]] = commit
+                    changed = True
+                continue
+            pid, root = plugin_id(x), codex_marketplace(p)
+            m = markets.get(x["marketplace"])
+            if m and not same_path(m.get("root"), root):
+                run([codex, "plugin", "marketplace", "remove", x["marketplace"]])
+                m, current = None, False
+            if not m:
+                run([codex, "plugin", "marketplace", "add", root])
+            if pid not in installed or not current:
+                run([codex, "plugin", "add", pid])  # copies the checkout into Codex's plugin cache
+                log(f"Codex: installed {pid} {p['pin']['ref']}")
+                done[p["name"]] = commit
+                changed = True
+        except Failed as e:
+            errors.append(f"Codex {p['name']}: {e}")
+    return changed
+
+
+# ---------------------------------------------------------------- profile
+
+def upsert_block(text: str, body: str) -> str:
+    block = f"{BLOCK_START}\n{body.strip()}\n{BLOCK_END}"
+    pattern = re.compile(re.escape(BLOCK_START) + r".*?" + re.escape(BLOCK_END), re.S)
+    if pattern.search(text):
+        return pattern.sub(lambda _: block, text, count=1)
+    return (text.rstrip("\n") + "\n\n" if text.strip() else "") + block + "\n"
+
+
+def apply_profile(profile: dict, errors: list) -> None:
+    for path, values in profile.get("config_files", {}).items():
+        f = expand(path)
+        try:
+            data = load_json(f, {})
+        except ValueError:
+            errors.append(f"profile: {f} is not valid JSON; left as is")
+            continue
+        if save_json(f, {**data, **values}):
+            log(f"profile: wrote {', '.join(f'{k}={v}' for k, v in values.items())} to {f}")
+    te = profile.get("tokeneconomizer")
+    te_cli = VENDOR / "tokeneconomizer" / "plugin" / "scripts" / "te"
+    if te and te_cli.exists():
+        try:
+            run([te_cli, "config", "set", *(f"{k}={v}" for k, v in te.items()), "--global"])
+        except Failed as e:
+            errors.append(f"profile: TokenEconomizer settings: {e}")
+    for path, source in profile.get("instruction_blocks", {}).items():
+        f = expand(path)
+        old = f.read_text() if f.exists() else ""
+        new = upsert_block(old, (ROOT / source).read_text())
+        if new != old:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(new)
+            log(f"profile: updated the managed block in {f}")
+
+
+# ---------------------------------------------------------------- requirements
+
+def version_of(tool: str):
+    r = run([tool, "--version"], check=False) if shutil.which(tool) else None
+    m = r and re.search(r"(\d+(?:\.\d+)+)", r.stdout + r.stderr)
+    return tuple(int(x) for x in m.group(1).split(".")) if m else None
+
+
+def requirement_warnings(plugins: list) -> list:
+    out = []
+    for p in plugins:
+        for tool, need in p.get("requires", {}).items():
+            have = version_of(tool)
+            want = tuple(int(x) for x in need.split("."))
+            if have is None:
+                out.append(f"{p['name']} needs {tool} {need}+, and {tool} is not on PATH")
+            elif have < want:
+                out.append(f"{p['name']} needs {tool} {need}+, found {'.'.join(map(str, have))}")
+    return out
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_sync(args) -> int:
+    log(f"sync {time.strftime('%Y-%m-%d %H:%M')}")
+    if not args.no_pull and (ROOT / ".git").exists():
+        before = head(ROOT)
+        r = run(["git", "-C", ROOT, "pull", "--ff-only", "-q"], check=False)
+        if r.returncode:
+            log(f"could not pull {ROOT} ({(r.stderr or r.stdout).strip()[-200:]}); using the pins already here")
+        elif head(ROOT) != before:
+            log("pulled new pins; restarting with them")
+            os.execv(sys.executable, [sys.executable, str(ROOT / "kozu"), *sys.argv[1:], "--no-pull"])
+    plugins = load_json(PLUGINS_FILE, {})["plugins"]
+    state = load_json(STATE_FILE, {})
+    errors = []
+    for p in plugins:
+        if not p.get("pin", {}).get("commit"):
+            errors.append(f"{p['name']} has no pin yet: run ./kozu bump and push")
+            continue
+        try:
+            if checkout(VENDOR / p["name"], repo_url(p), p["pin"]["commit"]):
+                log(f"{p['name']}: checked out {p['pin']['ref']} ({p['pin']['commit'][:7]})")
+        except Failed as e:
+            errors.append(f"{p['name']} checkout: {e}")
+    ready = [p for p in plugins if head(VENDOR / p["name"]) == p["pin"]["commit"]]
+    if args.host in (None, "claude"):
+        sync_claude(ready, errors)
+    codex_changed = args.host in (None, "codex") and sync_codex(ready, state, errors, args.force)
+    save_json(STATE_FILE, state)
+    apply_profile(load_json(PROFILE_FILE, {}), errors)
+    for w in requirement_warnings(plugins):
+        log(f"warning: {w}")
+    if codex_changed:
+        log("Codex: start codex and open /hooks to trust new or changed plugin hooks (Codex asks after each hook change)")
+    for e in errors:
+        log(f"error: {e}")
+    log("done" if not errors else f"done with {len(errors)} error(s)")
+    return 1 if errors else 0
+
+
+def cmd_status(args) -> int:
+    plugins = load_json(PLUGINS_FILE, {})["plugins"]
+    state = load_json(STATE_FILE, {})
+    claude, codex = shutil.which("claude"), shutil.which("codex")
+    cl = {p["id"]: p for p in run_json([claude, "plugin", "list", "--json"]) or []} if claude else None
+    cx = ({p["pluginId"] for p in (run_json([codex, "plugin", "list", "--json"]) or {}).get("installed", [])
+           if p.get("installed")} if codex else None)
+    rows = [("plugin", "pin", "checkout", "claude code", "codex")]
+    for p in plugins:
+        pin = p["pin"]
+        co = "ok" if head(VENDOR / p["name"]) == pin["commit"] else "needs sync"
+        c, x = p.get("claude"), p.get("codex")
+        info = cl.get(plugin_id(c)) if c and cl is not None else None
+        base = os.path.realpath(VENDOR / p["name"])
+        folder = os.path.realpath(info.get("readFromFolder") or "/") if info else ""
+        if not c:
+            c_s = "-"
+        elif cl is None:
+            c_s = "no claude"
+        elif info is None:
+            c_s = "not installed"
+        elif folder != base and not folder.startswith(base + os.sep):
+            c_s = "other source"
+        else:
+            c_s = "disabled" if info.get("enabled") is False else "ok"
+        if not x:
+            x_s = "-"
+        elif cx is None:
+            x_s = "no codex"
+        elif state.get("codex", {}).get(p["name"]) != pin["commit"]:
+            x_s = "needs sync"
+        else:
+            x_s = "ok" if "installer" in x or plugin_id(x) in cx else "not installed"
+        rows.append((p["name"], f"{pin['ref']} ({pin['commit'][:7]})", co, c_s, x_s))
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    for r in rows:
+        print("  ".join(v.ljust(w) for v, w in zip(r, widths)).rstrip())
+    for w in requirement_warnings(plugins):
+        print(f"warning: {w}")
+    return 0
+
+
+def cmd_bump(args) -> int:
+    data = load_json(PLUGINS_FILE, {})
+    changes, problems = [], []
+    for p in data["plugins"]:
+        try:
+            new = resolve(p)
+            if not new or new[1] == p.get("pin", {}).get("commit"):
+                continue
+            where = STATE_DIR / "verify" / p["name"]
+            checkout(where, repo_url(p), new[1])
+            issues = verify(p, where)
+        except Failed as e:
+            problems.append(str(e))
+            continue
+        if issues:
+            problems.append(f"{p['name']} {new[0]}: not bumped: {'; '.join(issues)}")
+            continue
+        old = p.get("pin", {}).get("ref", "none")
+        changes.append(f"{p['name']} {old} -> {new[0]}" if old != new[0] else f"{p['name']} {new[0]} ({new[1][:7]})")
+        p["pin"] = {"ref": new[0], "commit": new[1]}
+    if changes and not args.dry_run:
+        save_json(PLUGINS_FILE, data)
+    for c in changes:
+        print(f"bump: {c}")
+    for pr in problems:
+        print(f"::warning::{pr}" if os.environ.get("GITHUB_ACTIONS") else f"warning: {pr}")
+    if args.message_file and changes:
+        title = changes[0] if len(changes) == 1 else f"Bump {len(changes)} plugins"
+        Path(args.message_file).write_text(f"{title}\n\n" + "".join(f"- {c}\n" for c in changes))
+    if not changes:
+        print("bump: every pin is current")
+    return 1 if problems else 0
+
+
+def scheduled_env() -> dict:
+    return {k: os.environ[k] for k in PASS_ENV if os.environ.get(k)}
+
+
+def cmd_schedule(args) -> int:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    py, script, out = sys.executable, str(ROOT / "kozu"), str(STATE_DIR / "sync.log")
+    if sys.platform == "darwin":
+        plist = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        plist.write_bytes(plistlib.dumps({
+            "Label": LABEL, "ProgramArguments": [py, script, "sync"],
+            "StartInterval": args.hours * 3600, "RunAtLoad": True,
+            "StandardOutPath": out, "StandardErrorPath": out,
+            "EnvironmentVariables": scheduled_env(),
+        }))
+        domain = f"gui/{os.getuid()}"
+        run(["launchctl", "bootout", domain, plist], check=False)
+        run(["launchctl", "bootstrap", domain, plist])
+        log(f"launchd job {LABEL} runs sync every {args.hours}h; log: {out}")
+    elif shutil.which("crontab"):
+        env = " ".join(f"{k}={shlex.quote(v)}" for k, v in scheduled_env().items())
+        line = f"{int(time.time()) % 60} */{args.hours} * * * {env} {shlex.quote(py)} {shlex.quote(script)} sync >> {shlex.quote(out)} 2>&1 {CRON_MARK}"
+        _write_crontab(line.replace("%", r"\%"))
+        log(f"cron runs sync every {args.hours}h; log: {out}")
+    else:
+        log("no launchd or crontab here; run `kozu sync` yourself or from your own scheduler")
+        return 1
+    return 0
+
+
+def _write_crontab(line):
+    r = run(["crontab", "-l"], check=False)
+    lines = [ln for ln in (r.stdout.splitlines() if r.returncode == 0 else []) if CRON_MARK not in ln]
+    if line:
+        lines.append(line)
+    run(["crontab", "-"], input="".join(f"{ln}\n" for ln in lines))
+
+
+def cmd_unschedule(args) -> int:
+    if sys.platform == "darwin":
+        plist = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+        run(["launchctl", "bootout", f"gui/{os.getuid()}", plist], check=False)
+        plist.unlink(missing_ok=True)
+    elif shutil.which("crontab"):
+        _write_crontab(None)
+    log("scheduled sync removed")
+    return 0
+
+
+def cmd_install(args) -> int:
+    rc = cmd_sync(args)
+    if not args.no_schedule:
+        rc = cmd_schedule(args) or rc
+    return rc
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="kozu", description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("install", "sync"):
+        s = sub.add_parser(name)
+        s.add_argument("--no-pull", action="store_true", help="use the pins in this checkout as they are")
+        s.add_argument("--host", choices=("claude", "codex"), help="only this host")
+        s.add_argument("--force", action="store_true", help="reinstall Codex plugins even if current")
+        if name == "install":
+            s.add_argument("--no-schedule", action="store_true")
+            s.add_argument("--hours", type=int, default=6)
+    sub.add_parser("status")
+    b = sub.add_parser("bump")
+    b.add_argument("--dry-run", action="store_true")
+    b.add_argument("--message-file", help="write a commit message here when pins change")
+    s = sub.add_parser("schedule")
+    s.add_argument("--hours", type=int, default=6)
+    sub.add_parser("unschedule")
+    args = ap.parse_args(argv)
+    try:
+        return globals()[f"cmd_{args.cmd}"](args)
+    except Failed as e:
+        log(f"error: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

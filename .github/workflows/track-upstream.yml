@@ -1,0 +1,38 @@
+# Moves each plugin's pin in plugins.json to its newest upstream release, then pushes the change.
+# Machines pick it up on their next scheduled `kozu sync`.
+name: Track upstream releases
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency: track-upstream
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests
+        run: python3 -m unittest discover -s tests
+      - name: Bump pins
+        id: bump
+        run: |
+          set +e
+          ./kozu bump --message-file "$RUNNER_TEMP/message"
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+      - name: Commit and push
+        run: |
+          if git diff --quiet plugins.json; then echo "No new releases."; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -q -F "$RUNNER_TEMP/message" plugins.json
+          git push
+      # A release that fails the manifest checks is not pinned; fail the run so GitHub emails you.
+      - name: Report releases that were not pinned
+        if: steps.bump.outputs.status != '0'
+        run: exit 1
