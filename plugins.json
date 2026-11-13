@@ -5,8 +5,8 @@
       "repo": "mksglu/context-mode",
       "track": "release",
       "pin": {
-        "ref": "v2.1.9",
-        "commit": "edbebef22f63733c4dc61f3a45826cd481aa32c2"
+        "ref": "v2.1.10",
+        "commit": "4bffb4283bf2198b959062192882a8f33655c8d0"
       },
       "requires": {
         "node": "24.15"
