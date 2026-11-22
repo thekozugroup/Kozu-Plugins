@@ -47,8 +47,8 @@
       "repo": "JuliusBrussee/caveman",
       "track": "release",
       "pin": {
-        "ref": "v4.1.0",
-        "commit": "1e91f1306d602d4ca23618701b1185575ae1869b"
+        "ref": "v4.2.0",
+        "commit": "70f4f34e834893ea9af9f4fc6022266bd56d18b1"
       },
       "requires": {
         "node": "18"
